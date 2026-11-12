@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 #
 # claude-desktop-autoupdate — controlla se Anthropic ha pubblicato una nuova
-# versione di Claude Desktop e, se sì, la ricostruisce come RPM e la installa.
+# versione di Claude Desktop e, se sì, la ricostruisce come pacchetto nativo
+# (RPM su Fedora, pacchetto pacman su Arch) e la installa.
 #
-# Il download, la verifica della firma e la costruzione dell'RPM girano come
-# utente "nobody" (senza privilegi). Solo il "dnf install" finale gira come root.
+# Il download, la verifica della firma e la costruzione del pacchetto girano
+# come utente "nobody" (senza privilegi). Solo l'installazione finale
+# (dnf / pacman) gira come root.
 #
 # Uso:  sudo claude-desktop-autoupdate           aggiorna se serve
 #       sudo claude-desktop-autoupdate --check   dice solo se c'è un aggiornamento
@@ -12,7 +14,16 @@
 #
 set -euo pipefail
 
-BUILDER=/usr/local/libexec/claude-desktop/build-official.sh
+BUILDER=/usr/local/libexec/claude-desktop/build.sh
+
+# Quale distro: lo decide il gestore di pacchetti presente.
+if command -v dnf >/dev/null 2>&1; then
+    DISTRO=fedora
+elif command -v pacman >/dev/null 2>&1; then
+    DISTRO=arch
+else
+    echo "distro non supportata: serve dnf (Fedora) o pacman (Arch)" >&2; exit 1
+fi
 
 CHECK_ONLY=0
 FORCE=0
@@ -20,7 +31,7 @@ case "${1:-}" in
     "")        ;;
     --check)   CHECK_ONLY=1 ;;
     --force)   FORCE=1 ;;
-    -h|--help) sed -n '3,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '3,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)         echo "opzione sconosciuta: $1 (prova --help)" >&2; exit 1 ;;
 esac
 
@@ -44,10 +55,16 @@ read -r ver sha _ <<<"$latest"
 [ -n "${sha:-}" ] || { echo "risposta inattesa dall'indice: $latest" >&2; exit 1; }
 ver="${ver//-/.}"
 
-inst=""
-if rpm -q claude-desktop >/dev/null 2>&1; then
-    inst="$(rpm -q --qf '%{VERSION}' claude-desktop)"
-fi
+# Versione installata (senza release / pkgrel), vuota se non installato.
+installed_version() {
+    if [ "$DISTRO" = fedora ]; then
+        rpm -q --qf '%{VERSION}' claude-desktop 2>/dev/null || true
+    else
+        # "claude-desktop 1.2.3-1" -> "1.2.3"
+        pacman -Q claude-desktop 2>/dev/null | awk '{ v = $2; sub(/-[^-]*$/, "", v); print v }' || true
+    fi
+}
+inst="$(installed_version)"
 
 if [ "$inst" = "$ver" ] && [ "$FORCE" -eq 0 ]; then
     echo "già aggiornato ($inst)"
@@ -62,13 +79,21 @@ fi
 echo "aggiorno: ${inst:-non installato} -> $ver"
 asuser "$BUILDER" --outdir "$WORK/out" --expect-sha256 "$sha"
 
-rpm_file="$(find "$WORK/out" -maxdepth 1 -name 'claude-desktop-*.rpm' -print -quit)"
-[ -n "$rpm_file" ] || { echo "nessun RPM prodotto" >&2; exit 1; }
+if [ "$DISTRO" = fedora ]; then
+    rpm_file="$(find "$WORK/out" -maxdepth 1 -name 'claude-desktop-*.rpm' -print -quit)"
+    [ -n "$rpm_file" ] || { echo "nessun RPM prodotto" >&2; exit 1; }
 
-nevra="$(rpm -qp --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' "$rpm_file")"
-if rpm -q "$nevra" >/dev/null 2>&1; then
-    dnf reinstall -y "$rpm_file"
+    nevra="$(rpm -qp --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' "$rpm_file")"
+    if rpm -q "$nevra" >/dev/null 2>&1; then
+        dnf reinstall -y "$rpm_file"
+    else
+        dnf install -y "$rpm_file"
+    fi
 else
-    dnf install -y "$rpm_file"
+    pkg_file="$(find "$WORK/out" -maxdepth 1 -name 'claude-desktop-*.pkg.tar*' -print -quit)"
+    [ -n "$pkg_file" ] || { echo "nessun pacchetto prodotto" >&2; exit 1; }
+    # -U installa anche le dipendenze mancanti dai repository ufficiali.
+    # Con la stessa versione già installata, pacman la reinstalla.
+    pacman -U --noconfirm "$pkg_file"
 fi
-echo "claude-desktop $(rpm -q --qf '%{VERSION}' claude-desktop) installato"
+echo "claude-desktop $(installed_version) installato"

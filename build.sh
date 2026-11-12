@@ -1,22 +1,21 @@
 #!/usr/bin/env bash
 #
-# build-official.sh — repackage Anthropic's official Claude Desktop Linux build
-#                as a Fedora RPM.
+# build.sh — reimpacchetta la build Linux ufficiale di Claude Desktop (il .deb
+#            pubblicato da Anthropic) come pacchetto nativo:
+#              - RPM su Fedora (rpmbuild)
+#              - pacchetto pacman su Arch Linux e derivate (makepkg)
 #
-# Anthropic publishes an official Linux x86_64 build of Claude Desktop, but
-# only as a .deb. The payload inside is ordinary, self-contained Linux
-# content under /usr/lib/claude-desktop — nothing Debian-specific. This
-# script unwraps that payload and rebuilds it as a native RPM, so dnf can
-# install, upgrade and remove it.
+# Il contenuto dell'app è autonomo, in /usr/lib/claude-desktop, e non ha nulla
+# di specifico per Debian: lo script lo estrae e lo impacchetta senza toccarlo.
 #
-# Why not repack the Windows installer (as older Fedora scripts do): recent
-# Claude Desktop hard-requires the native module @ant/claude-native for
-# filesystem containment and refuses to start Claude Code without it
-# (error CC-2885), and Claude Code's terminal needs node-pty. In a Windows
-# repack both are win32 binaries, so Claude Code cannot work. The official
-# Linux build ships both as real ELF x86_64 objects.
+# Nulla di scaricato viene usato finché non supera la catena di fiducia di apt:
+# chiave di Anthropic fissata -> firma di InRelease (con Valid-Until) ->
+# checksum di Packages -> SHA256 del .deb.
 #
-# Runs entirely as your own user; root is only needed to install the result.
+# Parte dello script è ispirata a build-official.sh di
+# dewzor/claude-desktop-fedora (MIT).
+#
+# Gira come utente normale; root serve solo per installare il risultato.
 #
 set -euo pipefail
 # Pin the locale so every check gives the same result on every system.
@@ -29,7 +28,7 @@ set -euo pipefail
 export LC_ALL=C.UTF-8
 
 ARCH_DEB="amd64"
-ARCH_RPM="x86_64"
+ARCH_PKG="x86_64"
 # Anthropic's apt repository for the official Linux build. Its index is
 # signed with Anthropic's release key; KEY_FPR is the fingerprint published
 # in the Claude Code setup docs, and the key below is the one served at
@@ -74,23 +73,25 @@ KEY
 
 WORK=""
 DEB=""
-OUTDIR="$PWD/build/official"
+OUTDIR="$PWD/build"
 KEEP=0
 RELEASE="1"
 PRINT_LATEST=0
 EXPECT_SHA256=""
+FORMAT=""
+
 
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 info() { printf '\033[36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33mwarn:\033[0m %s\n' "$*" >&2; }
-
 usage() {
     cat <<EOF
 Usage: $0 [options]
 
+  --format F     rpm | arch (default: detected from dnf / pacman).
   --deb PATH     Use an already-downloaded .deb instead of fetching it.
-  --outdir DIR   Where to write the finished RPM (default: ./build/official).
-  --release N    RPM release field (default: 1).
+  --outdir DIR   Where to write the finished package (default: ./build).
+  --release N    Package release field (default: 1).
   --keep         Keep the build tree for inspection.
   --print-latest Verify the signed index, print "VERSION SHA256 FILENAME" for
                  the newest build, and exit without downloading it.
@@ -98,15 +99,12 @@ Usage: $0 [options]
                  Build only if the newest signed entry has this SHA256; stop
                  if the index changed since it was checked.
   -h, --help     Show this help.
-
-With no options: fetch the newest official Linux build from Anthropic's signed
-apt repository, verify it, produce an RPM in ./build/official, then print the
-dnf command to install it.
 EOF
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --format)  FORMAT="${2:?--format needs rpm or arch}"; shift 2 ;;
         --deb)     DEB="${2:?--deb needs a path}"; shift 2 ;;
         --outdir)  OUTDIR="${2:?--outdir needs a path}"; shift 2 ;;
         --release) RELEASE="${2:?--release needs a value}"; shift 2 ;;
@@ -118,17 +116,30 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-[ "$(uname -m)" = "$ARCH_RPM" ] || die "this script builds $ARCH_RPM only; this host is $(uname -m)"
+[ "$(uname -m)" = "$ARCH_PKG" ] || die "this script builds $ARCH_PKG only; this host is $(uname -m)"
+
+if [ -z "$FORMAT" ]; then
+    if command -v dnf >/dev/null 2>&1; then FORMAT=rpm
+    elif command -v pacman >/dev/null 2>&1; then FORMAT=arch
+    elif [ "$PRINT_LATEST" -eq 0 ]; then die "unsupported distro: need dnf (Fedora) or pacman (Arch), or pass --format"
+    fi
+fi
+case "${FORMAT:-}" in rpm|arch|"") ;; *) die "unknown --format: $FORMAT (rpm or arch)" ;; esac
 
 for c in curl gpg sha256sum; do
     command -v "$c" >/dev/null || die "missing required command: $c"
 done
 if [ "$PRINT_LATEST" -eq 0 ]; then
-    for c in ar tar xz rpmbuild file; do
-        command -v "$c" >/dev/null || die "missing required command: $c"
-    done
-    [ -x /usr/bin/rpmbuild ] || command -v rpmbuild >/dev/null \
-        || die "rpmbuild not found — install it with: sudo dnf install rpm-build"
+    if [ "$FORMAT" = rpm ]; then
+        for c in ar tar xz rpmbuild file; do
+            command -v "$c" >/dev/null || die "missing required command: $c (sudo dnf install rpm-build binutils file xz)"
+        done
+    else
+        [ "$(id -u)" -ne 0 ] || die "makepkg refuses to run as root: run this as a normal user"
+        for c in ar tar xz file makepkg fakeroot bsdtar; do
+            command -v "$c" >/dev/null || die "missing required command: $c (sudo pacman -S --needed base-devel binutils file xz)"
+        done
+    fi
 fi
 
 cleanup() {
@@ -142,7 +153,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-WORK="$(mktemp -d -t claude-desktop-rpm.XXXXXXXX)"
+WORK="$(mktemp -d -t claude-desktop-build.XXXXXXXX)"
 
 sha256_of() { sha256sum -- "$1" | cut -d' ' -f1; }
 
@@ -287,7 +298,7 @@ VERSION="$(sed -n 's/^Version:[[:space:]]*//p' "$WORK/ctrl/control" | head -1)"
 [ -n "$VERSION" ] || die "could not read Version: from the package control file"
 [ -z "$EXPECT_VERSION" ] || [ "$VERSION" = "$EXPECT_VERSION" ] \
     || die "package says version $VERSION but the signed index says $EXPECT_VERSION"
-# RPM forbids '-' in version; upstream has not used one, but be safe.
+# RPM and pacman both forbid '-' in version; upstream has not used one, but be safe.
 VERSION="${VERSION//-/.}"
 info "version: $VERSION"
 
@@ -346,6 +357,8 @@ elif [ -x "$WORK/payload/$RES/bin/ccd" ]; then
 fi
 
 # ------------------------------------------------------------ rpm build ------
+build_rpm() {
+# ------------------------------------------------------------ rpm build ------
 RB="$WORK/rpmbuild"
 mkdir -p "$RB"/{SOURCES,SPECS,BUILD,BUILDROOT,RPMS,SRPMS}
 info "staging payload..."
@@ -371,7 +384,7 @@ Summary:        Claude Desktop, repackaged from Anthropic's official Linux build
 License:        Proprietary
 URL:            https://claude.ai
 Source0:        claude-desktop-$VERSION.tar
-ExclusiveArch:  $ARCH_RPM
+ExclusiveArch:  $ARCH_PKG
 AutoReqProv:    no
 
 Requires:       gtk3
@@ -455,7 +468,7 @@ $EXTRA_FILES
 
 %changelog
 * $(LC_ALL=C date '+%a %b %d %Y') build-official.sh - $VERSION-$RELEASE
-- Repackage Anthropic's official Linux $ARCH_RPM build $VERSION for Fedora
+- Repackage Anthropic's official Linux $ARCH_PKG build $VERSION for Fedora
 SPEC
 
 info "building RPM (~530 MB payload, usually under a minute; log: $WORK/rpmbuild.log)..."
@@ -491,3 +504,83 @@ echo "Install with:"
 echo "    sudo dnf install $FINAL"
 echo
 echo "Then launch 'Claude' from your application menu, or run: claude-desktop"
+}
+
+# ------------------------------------------------------------ pkg build ------
+build_arch() {
+# Debian packaging metadata, meaningless on Arch.
+rm -rf "$WORK/payload/usr/share/lintian"
+PB="$WORK/pkg"
+mkdir -p "$PB/build" "$PB/out"
+info "writing PKGBUILD..."
+cat > "$PB/PKGBUILD" <<PKGBUILD
+# Generated by build-arch.sh from Anthropic's official Linux build.
+pkgname=claude-desktop
+pkgver=$VERSION
+pkgrel=$RELEASE
+pkgdesc="Claude Desktop, repackaged from Anthropic's official Linux build"
+arch=('$ARCH_PKG')
+url="https://claude.ai"
+license=('LicenseRef-Proprietary')
+depends=(
+    'gtk3' 'libnotify' 'nss' 'at-spi2-core' 'libdrm' 'mesa' 'libsecret'
+    'libxtst' 'util-linux-libs' 'alsa-lib' 'xdg-utils' 'xdg-desktop-portal'
+    'ca-certificates'
+)
+optdepends=(
+    'xdg-desktop-portal-gtk: file chooser and other portals outside GNOME/KDE'
+    'libappindicator-gtk3: tray icon'
+    'gnome-keyring: store credentials (or another Secret Service provider)'
+    'bubblewrap: Claude Code / Cowork sandboxing'
+    'socat: Claude Code / Cowork sandboxing'
+    'openssh: SSH remotes'
+    'pipewire: audio capture'
+    'gjs: GNOME search provider'
+    'qemu-system-x86: Cowork full-VM sandbox'
+    'edk2-ovmf: Cowork full-VM sandbox'
+    'virtiofsd: Cowork full-VM sandbox'
+)
+# Prebuilt upstream binaries: do not strip, split debug info or re-link.
+options=('!strip' '!debug' '!lto')
+
+package() {
+    cp -a "$WORK/payload/usr" "\$pkgdir/"
+    # The payload was extracted as an unprivileged user: hand it to root.
+    chown -R root:root "\$pkgdir"
+    # Chromium's SUID sandbox helper; upstream ships it 4755 and tar-as-user drops that.
+    chmod 4755 "\$pkgdir/usr/lib/claude-desktop/chrome-sandbox"
+}
+PKGBUILD
+
+info "building package (~530 MB payload; log: $PB/makepkg.log)..."
+# -d: dependencies are resolved by pacman -U at install time, not here.
+# PKGEXT=.pkg.tar: no compression, the package is installed right away.
+( cd "$PB" && BUILDDIR="$PB/build" PKGDEST="$PB/out" SRCDEST="$PB/build" \
+      LOGDEST="$PB" PKGEXT='.pkg.tar' \
+      makepkg -d -f --noconfirm --nocolor ) > "$PB/makepkg.log" 2>&1 \
+    || { tail -30 "$PB/makepkg.log" >&2; KEEP=1; die "makepkg failed (full log: $PB/makepkg.log)"; }
+
+PKG="$(find "$PB/out" -maxdepth 1 -name 'claude-desktop-*.pkg.tar' -print -quit)"
+[ -n "$PKG" ] || die "makepkg reported success but produced no package"
+
+mkdir -p "$OUTDIR"
+cp -- "$PKG" "$OUTDIR/"
+FINAL="$OUTDIR/$(basename "$PKG")"
+
+# Confirm the setuid bit and root ownership made it into the package.
+SANDBOX_LINE="$(bsdtar -tvf "$FINAL" 2>/dev/null | awk '/usr\/lib\/claude-desktop\/chrome-sandbox$/')"
+case "$SANDBOX_LINE" in
+    -rws*root*root*) info "chrome-sandbox setuid bit preserved" ;;
+    "")              warn "chrome-sandbox not found in the built package" ;;
+    *)               warn "chrome-sandbox is not setuid root ($SANDBOX_LINE); Chromium will fall back to the userns sandbox" ;;
+esac
+
+printf '\n\033[32mBuilt:\033[0m %s\n\n' "$FINAL"
+echo "Install with:"
+echo "    sudo pacman -U $FINAL"
+echo
+echo "Then launch 'Claude' from your application menu, or run: claude-desktop"
+}
+
+# --------------------------------------------------------------- build -------
+if [ "$FORMAT" = rpm ]; then build_rpm; else build_arch; fi
