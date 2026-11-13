@@ -42,6 +42,7 @@ WORK="$(mktemp -d -p /var/tmp claude-update.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
 chown nobody:nobody "$WORK"
 chmod 700 "$WORK"
+cd "$WORK"
 
 # Esegue un comando come utente "nobody", con la cartella di lavoro come home.
 asuser() {
